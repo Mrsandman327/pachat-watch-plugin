@@ -1,0 +1,8 @@
+{
+  "token": "pachat_suXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+  "session": "ses_eXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+  "prompt": "检查pachat收件箱消息，有新的消息进行回复",
+  "waitSeconds": 25,
+  "cooldownSeconds": 60,
+  "enabled": true
+}
