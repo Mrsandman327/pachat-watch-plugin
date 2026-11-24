@@ -39,6 +39,7 @@ const DEFAULT_PROMPT = "检查pachat收件箱消息，有新的消息进行回�
 const DEFAULT_BASE = "https://pachat.ai/api/v1"
 const DEFAULT_WAIT = 25
 const DEFAULT_COOLDOWN = 60
+const OWNER_WAKE_COOLDOWN = 10 * 60 * 1000
 const STATE_KEY = "watch/state"
 
 function log(...args: unknown[]) {
@@ -93,7 +94,7 @@ export default {
 
     const token = typeof o.token === "string" ? o.token.trim() : ""
     const target = typeof o.session === "string" ? o.session.trim() : ""
-    const prompt = typeof o.prompt === "string" && o.prompt.trim() ? o.prompt : DEFAULT_PROMPT
+    let prompt = typeof o.prompt === "string" && o.prompt.trim() ? o.prompt : DEFAULT_PROMPT
     const base = (typeof o.baseUrl === "string" && o.baseUrl.trim() ? o.baseUrl : DEFAULT_BASE).replace(/\/+$/, "")
     const wait = Math.min(Math.max(Number(o.waitSeconds ?? DEFAULT_WAIT) || DEFAULT_WAIT, 1), 25)
     let cooldown = Math.max(Number(o.cooldownSeconds ?? DEFAULT_COOLDOWN) || 0, 0) * 1000
@@ -114,6 +115,8 @@ export default {
       cursor: "",
       lastPollAt: null as string | null,
       lastWakeAt: null as string | null,
+      lastOwnerWakeAt: null as string | null,
+      lastOwnerCursor: "" as string,
       wakeCount: 0,
       wakeSkipped: 0,
       lastNeedsYou: 0,
@@ -134,22 +137,29 @@ export default {
       })
     }
 
-    // ---- 游标持久化 ----
+    // ---- 状态持久化（游标 + 已处理过的「主人发言」游标）----
     try {
-      const saved = (await ctx.storage.get(STATE_KEY)) as { cursor?: string } | undefined
+      const saved = (await ctx.storage.get(STATE_KEY)) as
+        | { cursor?: string; lastOwnerCursor?: string }
+        | undefined
       if (saved?.cursor) {
         state.cursor = saved.cursor
         log("恢复游标", state.cursor)
       }
+      if (saved?.lastOwnerCursor) state.lastOwnerCursor = saved.lastOwnerCursor
     } catch (e) {
       log("读取游标失败", String(e))
     }
 
-    async function saveCursor() {
+    async function saveState() {
       try {
-        await ctx.storage.set(STATE_KEY, { cursor: state.cursor, at: new Date().toISOString() })
+        await ctx.storage.set(STATE_KEY, {
+          cursor: state.cursor,
+          lastOwnerCursor: state.lastOwnerCursor,
+          at: new Date().toISOString(),
+        })
       } catch (e) {
-        log("保存游标失败", String(e))
+        log("保存状态失败", String(e))
       }
     }
 
@@ -157,16 +167,21 @@ export default {
     async function inbox(cursor: string, waitSec: number): Promise<Box> {
       let url = base + "/inbox"
       if (cursor) url += `?since=${encodeURIComponent(cursor)}&wait=${waitSec}`
-      const timeout = setTimeout(() => controller.abort(), (waitSec + 15) * 1000)
+      // 用局部 controller 做超时，避免超时把共享 controller 一起 abort、终止整个循环
+      const local = new AbortController()
+      const onAbort = () => local.abort()
+      controller.signal.addEventListener("abort", onAbort, { once: true })
+      const timeout = setTimeout(() => local.abort(), (waitSec + 15) * 1000)
       try {
         const res = await fetch(url, {
           headers: { Authorization: `Bearer ${token}`, Accept: "application/json" },
-          signal: controller.signal,
+          signal: local.signal,
         })
         if (!res.ok) throw new Error(`inbox HTTP ${res.status}`)
         return (await res.json()) as Box
       } finally {
         clearTimeout(timeout)
+        controller.signal.removeEventListener("abort", onAbort)
       }
     }
 
@@ -207,13 +222,38 @@ export default {
           const priming = !state.cursor
           if (box.cursor && box.cursor !== state.cursor) {
             state.cursor = box.cursor
-            await saveCursor()
+            await saveState()
           }
           if (priming) {
             log("初始化游标", state.cursor)
             continue
           }
-          if ((box.needsYou ?? 0) <= 0 && (box.unreadGroups ?? 0) <= 0) continue
+          // 区分「直接找我」和「主人随便说了句话」：
+          // direct = 被 @ / 被回复 / 被拉进群；ownerPosts = 主人在群里发言。
+          // 注意 needsYou 已经把主人发言算进去了，所以这里不能用它判断。
+          const groups = (box.groups ?? []) as any[]
+          const direct = groups.reduce(
+            (n, g) =>
+              n +
+              (Number(g?.mentionsYou) || 0) +
+              (Number(g?.repliesToYou) || 0) +
+              (Number(g?.addedByYourOwner) || 0),
+            0,
+          )
+          const ownerPosts = groups.reduce((n, g) => n + (Number(g?.fromYourOwner) || 0), 0)
+          state.lastNeedsYou = direct + ownerPosts
+          if (direct <= 0 && ownerPosts <= 0) continue
+
+          // 只有「主人发言」触发时限频：10 分钟一次，
+          // 免得主人跟别人对话时每句都把我叫起来。直接找我不限。
+          if (direct <= 0) {
+            // 同一条消息只因为「主人发言」唤醒一次；
+            // 不设时间冷却——主人发了新消息就该让我看一眼。
+            if (state.lastOwnerCursor === state.cursor) {
+              state.wakeSkipped++
+              continue
+            }
+          }
 
           const now = Date.now()
           const lastWakeMs = state.lastWakeAt ? Date.parse(state.lastWakeAt) : 0
@@ -228,9 +268,15 @@ export default {
             continue
           }
 
-          const reason = `needsYou=${box.needsYou ?? 0}, unreadGroups=${box.unreadGroups ?? 0}, cursor=${state.cursor}`
-          await wake(target, reason)
+          const reason = `direct=${direct}, ownerPosts=${ownerPosts}, cursor=${state.cursor}`
+          // 先记账再投递：投递超时/重试都不会重复唤醒同一条消息
+          if (direct <= 0) {
+            state.lastOwnerWakeAt = new Date().toISOString()
+            state.lastOwnerCursor = state.cursor
+            await saveState()
+          }
           lastWokeCursor = state.cursor
+          await wake(target, reason)
         } catch (e: any) {
           if (controller.signal.aborted) break
           state.lastError = String(e?.message ?? e)
@@ -292,6 +338,9 @@ export default {
           }
           if (typeof input?.session === "string" && input.session.trim()) {
             state.session = input.session.trim()
+          }
+          if (typeof input?.prompt === "string" && input.prompt.trim()) {
+            prompt = input.prompt
           }
           if (typeof input?.enabled === "boolean") {
             enabled = input.enabled

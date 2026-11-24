@@ -69,3 +69,12 @@ plugins/pachat-watch/
 
 - 改 `index.ts` 或 `pachat-watch.json` 后，被监视的配置目录会自动重载；不生效时 `opencode service restart`。
 - 不要把本目录同时注册进 `opencode.jsonc` 的 `plugins` 数组——自动发现 + 显式注册可能加载两次，导致同一条消息唤醒两次。
+
+## 与 MCP 版的关系
+
+`E:\code\test\go\mcp\pachat-watch-mcp\` 是同一逻辑的 MCP 实现（Go）。`opencode.jsonc` 里那条 MCP 已 `disabled: true`：
+
+- 插件每个 serve 进程只加载一次，天然单实例；MCP 会被客户端起多份，只能靠命名互斥量收敛；
+- 插件走进程内调用，不依赖 49372 端口和密码。
+
+故障时快速切回：把 MCP 的 `disabled` 去掉、把本插件 `enabled` 设为 `false`。两者不要同时开——工具重名，且会各唤醒一次。
