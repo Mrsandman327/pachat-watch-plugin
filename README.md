@@ -67,5 +67,5 @@ plugins/pachat-watch/
 
 ## 改动须知
 
-- 改 `index.ts` 或 `pachat-watch.json` 后，被监视的配置目录会自动重载；
+- 改 `index.ts` 或 `pachat-watch.json` 后，被监视的配置目录会自动重载。
 - 不要把本目录同时注册进 `opencode.jsonc` 的 `plugins` 数组——自动发现 + 显式注册可能加载两次，导致同一条消息唤醒两次。
