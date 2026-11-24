@@ -50,7 +50,6 @@ const DEFAULT_WAIT = 25
 const STATE_KEY = "watch/state"
 const LEADER_KEY = "watch/leader"
 const LEADER_TTL = 45 * 1000
-const instanceId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
 
 function log(...args: unknown[]) {
   try {
@@ -87,7 +86,8 @@ async function loadFileConfig(): Promise<{ cfg?: Options; path?: string; error?:
     if (!parsed || typeof parsed !== "object") throw new Error("不是 JSON 对象")
     return { cfg: parsed, path: file }
   } catch (e: any) {
-    return { error: `${CONFIG_FILE}: ${String(e?.message ?? e)}` }
+    // 不回显原始 message：JSON.parse 的错误信息可能带上 token 片段
+    return { error: `${CONFIG_FILE}: ${String(e?.code ?? e?.name ?? "read or parse failed")}` }
   }
 }
 
@@ -102,8 +102,9 @@ export default {
     if (fromFile.error) log("读配置失败，回退到 options：", fromFile.error)
     else log("配置来源", configSource)
 
+    const instanceId = `${Date.now()}-${Math.random().toString(36).slice(2)}`
     const token = typeof o.token === "string" ? o.token.trim() : ""
-    const target = typeof o.session === "string" ? o.session.trim() : ""
+    let target = typeof o.session === "string" ? o.session.trim() : ""
     let prompt = typeof o.prompt === "string" && o.prompt.trim() ? o.prompt : DEFAULT_PROMPT
     const base = (typeof o.baseUrl === "string" && o.baseUrl.trim() ? o.baseUrl : DEFAULT_BASE).replace(/\/+$/, "")
     const wait = Math.min(Math.max(Number(o.waitSeconds ?? DEFAULT_WAIT) || DEFAULT_WAIT, 1), 25)
@@ -122,52 +123,70 @@ export default {
     const state = {
       running: false,
       leader: false,
+      primed: false,
       cursor: "",
       lastPollAt: null as string | null,
       lastWakeAt: null as string | null,
-      lastOwnerWakeAt: null as string | null,
-      lastOwnerCursor: "" as string,
       handled: {} as Record<string, number>,
+      pending: null as null | { reason: string; cursor: string; groups: { gid: string; seq: number }[] },
       wakeCount: 0,
       wakeSkipped: 0,
       lastNeedsYou: 0,
       lastError: "" as string,
-      lastBusy: false,
       session: target,
       configSource,
       configError: fromFile.error ?? "",
     }
-    let lastWokeCursor = ""
     let loopPromise: Promise<void> | null = null
+    let heartbeat: ReturnType<typeof setInterval> | null = null
 
     function startLoop() {
       if (loopPromise) return
       loopPromise = loop().finally(() => {
         loopPromise = null
+        if (enabled && !controller.signal.aborted) startLoop()
       })
     }
 
-    // ---- 状态持久化（游标 + 已处理过的「主人发言」游标）----
+    // ---- 状态持久化（游标 + 每群已投递 seq + 待投递 outbox）----
     try {
       const saved = (await ctx.storage.get(STATE_KEY)) as
-        | { cursor?: string; lastOwnerCursor?: string; handled?: Record<string, number> }
+        | {
+            cursor?: string
+            primed?: boolean
+            handled?: Record<string, number>
+            pending?: { reason: string; cursor: string; groups: { gid: string; seq: number }[] } | null
+          }
         | undefined
       if (saved?.cursor) {
         state.cursor = saved.cursor
+        state.primed = true
         log("恢复游标", state.cursor)
       }
-      if (saved?.lastOwnerCursor) state.lastOwnerCursor = saved.lastOwnerCursor
-      if (saved?.handled && typeof saved.handled === "object") state.handled = saved.handled
+      if (saved?.primed) state.primed = true
+      if (saved?.handled && typeof saved.handled === "object" && !Array.isArray(saved.handled)) {
+        state.handled = saved.handled
+      }
+      if (saved?.pending) state.pending = saved.pending
     } catch (e) {
       log("读取游标失败", String(e))
     }
 
     async function saveState() {
       try {
+        // 只有 leader 才写，避免僵尸实例覆盖新 leader 的状态
+        const lead = (await ctx.storage.get(LEADER_KEY)) as { id?: string } | undefined
+        if (lead?.id && lead.id !== instanceId) return
+        const prev = (await ctx.storage.get(STATE_KEY)) as { handled?: Record<string, number> } | undefined
+        const merged: Record<string, number> = { ...(prev?.handled ?? {}) }
+        for (const [g, s] of Object.entries(state.handled)) {
+          merged[g] = Math.max(merged[g] || 0, Number(s) || 0)
+        }
         await ctx.storage.set(STATE_KEY, {
           cursor: state.cursor,
-          lastOwnerCursor: state.lastOwnerCursor,
-          handled: state.handled,
+          primed: state.primed,
+          handled: merged,
+          pending: state.pending,
           at: new Date().toISOString(),
         })
       } catch (e) {
@@ -176,12 +195,30 @@ export default {
     }
 
     // ---- 单实例 leader：热重载/双加载时，只有 leader 真正轮询 ----
+    function startHeartbeat() {
+      if (heartbeat) return
+      heartbeat = setInterval(() => {
+        ctx.storage.set(LEADER_KEY, { id: instanceId, at: Date.now() }).catch(() => {})
+      }, 15000)
+    }
+    function stopHeartbeat() {
+      if (heartbeat) {
+        clearInterval(heartbeat)
+        heartbeat = null
+      }
+    }
+
     async function becomeLeader(): Promise<boolean> {
       try {
         const cur = (await ctx.storage.get(LEADER_KEY)) as { id?: string; at?: number } | undefined
         const now = Date.now()
         if (cur?.id && cur.id !== instanceId && cur.at && now - cur.at < LEADER_TTL) return false
         await ctx.storage.set(LEADER_KEY, { id: instanceId, at: now })
+        // 让出一拍再看，降低"两个实例同时抢到"的概率
+        await sleep(250, controller.signal)
+        const check = (await ctx.storage.get(LEADER_KEY)) as { id?: string } | undefined
+        if (check?.id !== instanceId) return false
+        startHeartbeat()
         return true
       } catch {
         return true
@@ -190,8 +227,8 @@ export default {
 
     // ---- Pachat 收件箱长轮询 ----
     async function inbox(cursor: string, waitSec: number): Promise<Box> {
-      let url = base + "/inbox"
-      if (cursor) url += `?since=${encodeURIComponent(cursor)}&wait=${waitSec}`
+      let url = base + "/inbox" + `?wait=${waitSec}`
+      if (cursor) url += `&since=${encodeURIComponent(cursor)}`
       // 用局部 controller 做超时，避免超时把共享 controller 一起 abort、终止整个循环
       const local = new AbortController()
       const onAbort = () => local.abort()
@@ -210,17 +247,6 @@ export default {
       }
     }
 
-    // ---- 会话忙闲 ----
-    async function busy(sessionID: string): Promise<boolean> {
-      try {
-        const s: any = await ctx.session.get({ sessionID })
-        const t = s?.time ?? s?.data?.time ?? {}
-        if (!t.busy) return false
-        return !t.idle || t.busy > t.idle
-      } catch {
-        return false
-      }
-    }
 
     // ---- 唤醒 ----
     async function wake(sessionID: string, reason: string) {
@@ -291,23 +317,51 @@ export default {
         try {
           if (!(await becomeLeader())) {
             state.leader = false
+            stopHeartbeat()
             log("非 leader，等待接管")
             await sleep(5000, controller.signal)
             continue
           }
+          const becameLeader = !state.leader
           state.leader = true
+          if (becameLeader) {
+            // 接管时合并存储里的水位，避免用陈旧状态重复投递
+            const saved = (await ctx.storage.get(STATE_KEY)) as any
+            for (const [g, s] of Object.entries(saved?.handled ?? {})) {
+              const v = Number(s) || 0
+              if (v > (state.handled[g] || 0)) state.handled[g] = v
+            }
+            if (saved?.pending) state.pending = saved.pending
+          }
+
+          // 有未完成的投递：先补投，成功后才推进游标/水位（丢消息的唯一入口）
+          if (state.pending) {
+            try {
+              await wake(target, state.pending.reason)
+            } catch (e: any) {
+              state.lastError = String(e?.message ?? e)
+              log("补投失败，保留 pending", state.lastError)
+              await sleep(5000, controller.signal)
+              continue
+            }
+            for (const pp of state.pending.groups) {
+              if (pp.seq > (state.handled[pp.gid] || 0)) state.handled[pp.gid] = pp.seq
+            }
+            if (state.pending.cursor) state.cursor = state.pending.cursor
+            state.pending = null
+            await saveState()
+          }
 
           const box = await inbox(state.cursor, wait)
           state.lastPollAt = new Date().toISOString()
           state.lastNeedsYou = box.needsYou ?? 0
           state.lastError = ""
 
-          const priming = !state.cursor
-          if (box.cursor && box.cursor !== state.cursor) {
-            state.cursor = box.cursor
+          const nextCursor = box.cursor || state.cursor
+          if (!state.primed) {
+            state.primed = true
+            state.cursor = nextCursor
             await saveState()
-          }
-          if (priming) {
             log("初始化游标", state.cursor)
             continue
           }
@@ -325,7 +379,11 @@ export default {
           )
           const ownerPosts = groups.reduce((n, g) => n + (Number(g?.fromYourOwner) || 0), 0)
           state.lastNeedsYou = direct + ownerPosts
-          if (direct <= 0 && ownerPosts <= 0) continue
+          if (direct <= 0 && ownerPosts <= 0) {
+            state.cursor = nextCursor
+            await saveState()
+            continue
+          }
 
           // 按「每群 lastSeq」去重：只有出现比上次已投递更靠后的消息才唤醒。
           // seq 单调，比 cursor 稳：热重载、长任务、未读未变都不会重复投递同一条消息。
@@ -339,38 +397,48 @@ export default {
               (Number(g?.fromYourOwner) || 0)
             if (cnt <= 0) return false
             const lastSeq = Number(g?.lastSeq) || 0
+            if (lastSeq <= 0) return true
             const lastRead = Number(g?.lastReadSeq) || 0
-            if (lastSeq <= lastRead) return false
+            if (lastSeq <= lastRead && (state.handled[gid] || 0) >= lastSeq) return false
             return lastSeq > (state.handled[gid] || 0)
           })
           if (fresh.length === 0) {
             state.wakeSkipped++
+            state.cursor = nextCursor
+            await saveState()
             continue
           }
 
-          // 不再因为会话忙而丢弃：OpenCode 会话自带消息队列，直接投递即可（忙就排队）
-          state.lastBusy = await busy(target)
-
           const reason = `direct=${direct}, ownerPosts=${ownerPosts}, cursor=${state.cursor}`
-          // 秒回「收到」（best-effort，带一次重试），拿到 ack 的 seq
-          const ackSeqs = await ack(fresh)
-          lastWokeCursor = state.cursor
-          // 先投递；投递失败就保留 handled，下一轮重试 —— 绝不丢消息
+          // 先把 pending 落盘，再 ack/wake —— 投递失败或进程崩溃都不会丢消息
+          state.pending = {
+            reason,
+            cursor: nextCursor,
+            groups: fresh.map((g) => ({ gid: g.id!, seq: Number(g?.lastSeq) || 0 })),
+          }
+          await saveState()
+
+          // 秒回「收到」（best-effort，带一次重试）
+          await ack(fresh)
+
           try {
             await wake(target, reason)
           } catch (e: any) {
             state.lastError = String(e?.message ?? e)
-            log("唤醒失败，保留 handled 以便重试", state.lastError)
+            log("唤醒失败，保留 pending", state.lastError)
             await sleep(5000, controller.signal)
             continue
           }
-          // 投递成功后再推进去重水位并落盘
+
+          // 投递成功：推进水位 + 游标，清空 pending
           for (const g of fresh) {
             const gid = g?.id
             if (!gid) continue
-            const seq = Math.max(Number(g?.lastSeq) || 0, ackSeqs[gid] || 0)
+            const seq = Number(g?.lastSeq) || 0
             if (seq > (state.handled[gid] || 0)) state.handled[gid] = seq
           }
+          state.cursor = nextCursor
+          state.pending = null
           await saveState()
         } catch (e: any) {
           if (controller.signal.aborted) break
@@ -427,7 +495,8 @@ export default {
         },
         execute: async (input: any) => {
           if (typeof input?.session === "string" && input.session.trim()) {
-            state.session = input.session.trim()
+            target = input.session.trim()
+            state.session = target
           }
           if (typeof input?.prompt === "string" && input.prompt.trim()) {
             prompt = input.prompt
@@ -467,19 +536,25 @@ export default {
     if (enabled) startLoop()
 
     // 卸载时停止
-    return () => {
+    return async () => {
       try {
         controller.abort()
       } catch {
         /* ignore */
       }
+      stopHeartbeat()
+      try {
+        await loopPromise?.catch(() => {})
+      } catch {
+        /* ignore */
+      }
       // 释放 leader，让下一个实例立刻接管
-      Promise.resolve()
-        .then(async () => {
-          const cur = (await ctx.storage.get(LEADER_KEY)) as any
-          if (cur?.id === instanceId) await ctx.storage.set(LEADER_KEY, { id: "", at: 0 })
-        })
-        .catch(() => {})
+      try {
+        const cur = (await ctx.storage.get(LEADER_KEY)) as any
+        if (cur?.id === instanceId) await ctx.storage.set(LEADER_KEY, { id: "", at: 0 })
+      } catch {
+        /* ignore */
+      }
     }
   },
 }
