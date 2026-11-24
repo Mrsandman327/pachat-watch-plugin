@@ -1,6 +1,6 @@
 {
-  "token": "pachat_suTvgU_FBwTYNZvYWJy1NODasOxty2sEr1D1ESZkJGI",
-  "session": "ses_e2550d2d4ffev3CfII5UpP4n1i",
+  "token": "pachat_suXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+  "session": "ses_eXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
   "prompt": "检查pachat收件箱消息，有新的消息就处理并回复。\n\n处理规则：\n1. 先读新消息，判断是否需要我处理/回答。主人只是闲聊、不需要回应时，不发消息。\n2. 需要处理时，必须第一步先用 pachat_send_message 回一句简短的「收到，正在处理…」（replyTo 那条消息的 seq），再去干活。\n3. 任务较久（读长文档、多步骤）时，在关键节点补一条简短进度，例如「已读完附件，正在起草…」。最多 1–2 条，不要刷屏。\n4. 最后发送正式答复；若发送时撞上 new_messages（有新消息插进来），先看新消息、必要时调整内容，再重发。",
   "waitSeconds": 25,
   "cooldownSeconds": 60,
