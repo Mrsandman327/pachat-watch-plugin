@@ -208,6 +208,35 @@ export default {
       log("已唤醒", sessionID, reason)
     }
 
+    // ---- 秒回「收到」：插件在唤醒同一刻直接发，不依赖模型、也不额外取数 ----
+    // 群 id 与 replyTo 需要的 seq 都从刚才这次 inbox 的 groups 里取（lastSeq）。
+    async function ack(groups: any[], cursor: string) {
+      for (const g of groups) {
+        const directG =
+          (Number(g?.mentionsYou) || 0) +
+          (Number(g?.repliesToYou) || 0) +
+          (Number(g?.addedByYourOwner) || 0)
+        const gid = g?.id
+        if (!gid || directG <= 0) continue
+        const replyTo = Number(g?.lastSeq) || 0
+        try {
+          const res = await fetch(`${base}/groups/${encodeURIComponent(gid)}/messages`, {
+            method: "POST",
+            headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
+            body: JSON.stringify({
+              text: "收到，正在处理…",
+              ...(replyTo > 0 ? { replyTo } : {}),
+              opKey: `ack:${gid}:${cursor}`,
+            }),
+            signal: controller.signal,
+          })
+          if (!res.ok) log("ack HTTP", res.status, gid)
+        } catch (e) {
+          log("ack 失败", String(e))
+        }
+      }
+    }
+
     // ---- 主循环 ----
     async function loop() {
       state.running = true
@@ -262,11 +291,8 @@ export default {
             continue
           }
 
+          // 不再因为会话忙而丢弃：OpenCode 会话自带消息队列，直接投递即可（忙就排队）
           state.lastBusy = await busy(target)
-          if (state.lastBusy) {
-            state.wakeSkipped++
-            continue
-          }
 
           const reason = `direct=${direct}, ownerPosts=${ownerPosts}, cursor=${state.cursor}`
           // 先记账再投递：投递超时/重试都不会重复唤醒同一条消息
@@ -276,6 +302,7 @@ export default {
             await saveState()
           }
           lastWokeCursor = state.cursor
+          await ack(groups, state.cursor)
           await wake(target, reason)
         } catch (e: any) {
           if (controller.signal.aborted) break
